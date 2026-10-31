@@ -1,0 +1,492 @@
+/*
+  BAN SAO LUU CUA MAIN.CPP (MAY XIT NUOC HOA - DEMO 1 CHAI)
+  Ngay tao ban sao: 2026-10-19
+*/
+
+#include <Arduino.h>
+#include <SPI.h>
+#include <TFT_eSPI.h>
+#include <ESP32Servo.h>
+#include <Preferences.h>
+#include <WiFi.h>
+#include <WiFiClientSecure.h>
+#include <HTTPClient.h>
+#include <ArduinoJson.h>
+#include <qrcode.h>
+
+// ===================== CAU HINH =====================
+#define DEMO_PAYMENT 1
+
+const char* WIFI_SSID   = "TEN_WIFI";
+const char* WIFI_PASS   = "MAT_KHAU_WIFI";
+
+const char* BANK_BIN    = "970422";
+const char* ACCOUNT_NO  = "0123456789";
+
+const char* SEPAY_TOKEN = "DAN_TOKEN_VAO_DAY";
+
+const int NUM_BOTTLES = 1;
+const int SERVO_PIN[2] = {13, 14};
+
+struct Package { uint32_t price; uint8_t sprays; };
+const int NUM_PACKAGES = 3;
+const Package PACKAGES[NUM_PACKAGES] = {
+  {2000, 1},
+  {5000, 3},
+  {10000, 5}
+};
+
+const uint32_t PAY_TIMEOUT_MS = 60000;
+const uint32_t SESSION_MS     = 30000;
+const uint32_t MIN_GAP_MS     = 2500;
+
+const int DEF_REST  = 30;
+const int DEF_PRESS = 50;
+
+const int PRESS_STEP_MS  = 8;
+const int HOLD_MS        = 350;
+const int RETURN_STEP_MS = 12;
+
+#define QR_VERSION 8
+// ====================================================
+
+TFT_eSPI tft = TFT_eSPI();
+Preferences prefs;
+Servo servos[2];
+int restAngle[2]  = {DEF_REST, DEF_REST};
+int pressAngle[2] = {DEF_PRESS, DEF_PRESS};
+
+String pkgLabel[NUM_PACKAGES];
+const char* BOTTLE_LABEL[2] = {"CHAI 1", "CHAI 2"};
+
+enum State { ST_HOME, ST_PACKAGE, ST_QR, ST_SPRAY, ST_DONE, ST_ADMIN };
+State state = ST_HOME;
+
+int selBottle = 0, selPackage = 0;
+String orderCode, qrPayload;
+uint32_t stateStart = 0, lastPoll = 0, lastTick = 0, lastSpray = 0;
+int spraysLeft = 0;
+bool sprayReady = true;
+int adminBottle = 0;
+
+bool touching = false, tapEvent = false;
+uint16_t tx = 0, ty = 0;
+
+void pollTouch() {
+  uint16_t x, y;
+  bool t = tft.getTouch(&x, &y);
+  tapEvent = t && !touching;
+  if (t) { tx = x; ty = y; }
+  touching = t;
+}
+
+struct Btn { int x, y, w, h; const char* label; uint16_t color; };
+
+void drawBtn(const Btn& b, int font = 4, bool enabled = true) {
+  uint16_t c = enabled ? b.color : TFT_DARKGREY;
+  tft.fillRoundRect(b.x, b.y, b.w, b.h, 8, c);
+  tft.drawRoundRect(b.x, b.y, b.w, b.h, 8, TFT_WHITE);
+  tft.setTextColor(TFT_WHITE, c);
+  tft.setTextDatum(MC_DATUM);
+  tft.drawString(b.label, b.x + b.w / 2, b.y + b.h / 2, font);
+}
+
+bool hit(const Btn& b, int x, int y) {
+  return x >= b.x && x < b.x + b.w && y >= b.y && y < b.y + b.h;
+}
+
+const Btn btnBack   = {20, 196, 110, 34, "Quay lai", TFT_MAROON};
+const Btn btnCancel = {218, 194, 98, 34, "Huy", TFT_MAROON};
+const Btn btnSim    = {218, 150, 98, 34, "Gia lap TT", TFT_ORANGE};
+const Btn btnXit    = {60, 50, 200, 90, "XIT", TFT_RED};
+const Btn btnBusy   = {60, 50, 200, 90, "DANG XIT...", TFT_ORANGE};
+
+const Btn adm[7] = {
+  {20, 70, 60, 40, "-", TFT_NAVY},   {240, 70, 60, 40, "+", TFT_NAVY},
+  {20, 130, 60, 40, "-", TFT_NAVY},  {240, 130, 60, 40, "+", TFT_NAVY},
+  {20, 190, 130, 40, "TEST", TFT_ORANGE}, {170, 190, 130, 40, "LUU", TFT_DARKGREEN},
+  {250, 28, 64, 26, "DOI CHAI", TFT_PURPLE}
+};
+
+Btn homeBtn(int i) {
+  int w = (NUM_BOTTLES == 1) ? 200 : 140;
+  int gap = 20;
+  int total = NUM_BOTTLES * w + (NUM_BOTTLES - 1) * gap;
+  int x = (320 - total) / 2 + i * (w + gap);
+  return Btn{x, 100, w, 80, BOTTLE_LABEL[i], TFT_NAVY};
+}
+
+Btn pkgBtn(int i) {
+  return Btn{20, 36 + i * 52, 280, 44, pkgLabel[i].c_str(), TFT_DARKGREEN};
+}
+
+void title(const char* t, uint16_t bg = TFT_NAVY) {
+  tft.fillRect(0, 0, 320, 24, bg);
+  tft.setTextColor(TFT_WHITE, bg);
+  tft.setTextDatum(MC_DATUM);
+  tft.drawString(t, 160, 12, 2);
+}
+
+String fmtMoney(uint32_t v) {
+  String s = String(v), out = "";
+  int c = 0;
+  for (int i = s.length() - 1; i >= 0; i--) {
+    out = String(s[i]) + out;
+    if (++c % 3 == 0 && i > 0) out = "." + out;
+  }
+  return out;
+}
+
+String tlv(const char* id, const String& v) {
+  char len[3];
+  snprintf(len, sizeof(len), "%02d", (int)v.length());
+  return String(id) + len + v;
+}
+
+uint16_t crc16(const String& s) {
+  uint16_t crc = 0xFFFF;
+  for (size_t i = 0; i < s.length(); i++) {
+    crc ^= (uint16_t)((uint8_t)s[i]) << 8;
+    for (int b = 0; b < 8; b++)
+      crc = (crc & 0x8000) ? (uint16_t)((crc << 1) ^ 0x1021) : (uint16_t)(crc << 1);
+  }
+  return crc;
+}
+
+String buildVietQR(uint32_t amount, const String& memo) {
+  String acct = tlv("00", BANK_BIN) + tlv("01", ACCOUNT_NO);
+  String merchant = tlv("00", "A000000727") + tlv("01", acct) + tlv("02", "QRIBFTTA");
+  String p = tlv("00", "01") + tlv("01", "12") + tlv("38", merchant) +
+             tlv("53", "704") + tlv("54", String(amount)) + tlv("58", "VN") +
+             tlv("62", tlv("08", memo));
+  p += "6304";
+  char crc[5];
+  snprintf(crc, sizeof(crc), "%04X", crc16(p));
+  p += crc;
+  return p;
+}
+
+void drawQR(const String& payload) {
+  static uint8_t buf[320];
+  QRCode qr;
+  tft.setTextDatum(MC_DATUM);
+  if (payload.length() > 190 || qrcode_getBufferSize(QR_VERSION) > sizeof(buf) ||
+      qrcode_initText(&qr, buf, QR_VERSION, ECC_LOW, payload.c_str()) != 0) {
+    tft.setTextColor(TFT_RED, TFT_BLACK);
+    tft.drawString("Loi tao ma QR", 100, 120, 2);
+    return;
+  }
+  const int S = 4, ox = 10, oy = 32;
+  int total = qr.size * S;
+  tft.fillRect(ox - 6, oy - 6, total + 12, total + 12, TFT_WHITE);
+  for (int y = 0; y < qr.size; y++)
+    for (int x = 0; x < qr.size; x++)
+      if (qrcode_getModule(&qr, x, y)) tft.fillRect(ox + x * S, oy + y * S, S, S, TFT_BLACK);
+}
+
+bool checkPaidSepay(const String& code, uint32_t price) {
+  if (WiFi.status() != WL_CONNECTED) return false;
+  WiFiClientSecure client;
+  client.setInsecure();
+  HTTPClient http;
+  http.setTimeout(4000);
+  if (!http.begin(client, "https://my.sepay.vn/userapi/transactions/list?limit=10")) return false;
+  http.addHeader("Authorization", String("Bearer ") + SEPAY_TOKEN);
+  int httpCode = http.GET();
+  bool paid = false;
+  if (httpCode == 200) {
+    String body = http.getString();
+    DynamicJsonDocument doc(12288);
+    if (!deserializeJson(doc, body)) {
+      JsonArray arr = doc["transactions"].as<JsonArray>();
+      for (JsonObject t : arr) {
+        String content = t["transaction_content"] | "";
+        double amt = t["amount_in"].as<double>();
+        if (content.indexOf(code) >= 0 && amt >= (double)price - 0.5) { paid = true; break; }
+      }
+    }
+  } else {
+    Serial.printf("SePay HTTP %d\n", httpCode);
+  }
+  http.end();
+  return paid;
+}
+
+void doSpray(int b) {
+  int r = restAngle[b], p = pressAngle[b];
+  int dir = (p >= r) ? 1 : -1;
+  for (int a = r; a != p; a += dir) { servos[b].write(a); delay(PRESS_STEP_MS); }
+  servos[b].write(p);
+  delay(HOLD_MS);
+  for (int a = p; a != r; a -= dir) { servos[b].write(a); delay(RETURN_STEP_MS); }
+  servos[b].write(r);
+}
+
+void goHome() {
+  state = ST_HOME;
+  tft.fillScreen(TFT_BLACK);
+  tft.setTextColor(TFT_WHITE, TFT_BLACK);
+  tft.setTextDatum(MC_DATUM);
+  tft.drawString("MAY XIT NUOC HOA", 160, 40, 4);
+  tft.setTextColor(TFT_LIGHTGREY, TFT_BLACK);
+  tft.drawString("Cham de chon chai", 160, 70, 2);
+  for (int i = 0; i < NUM_BOTTLES; i++) drawBtn(homeBtn(i));
+#if !DEMO_PAYMENT
+  tft.setTextColor(WiFi.status() == WL_CONNECTED ? TFT_GREEN : TFT_RED, TFT_BLACK);
+  tft.drawString(WiFi.status() == WL_CONNECTED ? "WiFi OK" : "Mat WiFi", 160, 224, 2);
+#endif
+}
+
+void goPackage() {
+  state = ST_PACKAGE;
+  tft.fillScreen(TFT_BLACK);
+  title((String("CHON GOI XIT - CHAI ") + (selBottle + 1)).c_str());
+  for (int i = 0; i < NUM_PACKAGES; i++) drawBtn(pkgBtn(i));
+  drawBtn(btnBack, 2);
+}
+
+void drawCountdown(uint32_t sec) {
+  tft.fillRect(218, 108, 98, 34, TFT_BLACK);
+  tft.setTextColor(TFT_YELLOW, TFT_BLACK);
+  tft.setTextDatum(MC_DATUM);
+  tft.drawString(String(sec) + "s", 266, 125, 4);
+}
+
+void goQR() {
+  state = ST_QR;
+  stateStart = millis();
+  lastTick = 0;
+  lastPoll = millis();
+  const Package& pk = PACKAGES[selPackage];
+  orderCode = "XIT" + String(random(100000, 1000000));
+  qrPayload = buildVietQR(pk.price, orderCode);
+  Serial.println(qrPayload);
+  tft.fillScreen(TFT_BLACK);
+  title("QUET MA QR DE THANH TOAN");
+  drawQR(qrPayload);
+  tft.setTextDatum(MC_DATUM);
+  tft.setTextColor(TFT_WHITE, TFT_BLACK);
+  tft.drawString(fmtMoney(pk.price) + " VND", 266, 44, 2);
+  tft.setTextColor(TFT_LIGHTGREY, TFT_BLACK);
+  tft.drawString("Noi dung CK:", 266, 66, 2);
+  tft.setTextColor(TFT_CYAN, TFT_BLACK);
+  tft.drawString(orderCode, 266, 84, 2);
+  drawBtn(btnCancel, 2);
+#if DEMO_PAYMENT
+  drawBtn(btnSim, 2);
+#else
+  tft.setTextColor(TFT_LIGHTGREY, TFT_BLACK);
+  tft.drawString("Dang cho tien...", 266, 165, 2);
+#endif
+}
+
+void updateSprayInfo() {
+  uint32_t elapsed = millis() - stateStart;
+  uint32_t left = (elapsed >= SESSION_MS) ? 0 : (SESSION_MS - elapsed + 999) / 1000;
+  tft.fillRect(0, 150, 320, 90, TFT_BLACK);
+  tft.setTextDatum(MC_DATUM);
+  tft.setTextColor(TFT_WHITE, TFT_BLACK);
+  tft.drawString("Con lai: " + String(spraysLeft) + " lan", 160, 168, 4);
+  tft.setTextColor(TFT_YELLOW, TFT_BLACK);
+  tft.drawString("Thoi gian: " + String(left) + "s", 160, 205, 2);
+}
+
+void goSpray() {
+  state = ST_SPRAY;
+  stateStart = millis();
+  spraysLeft = PACKAGES[selPackage].sprays;
+  lastSpray = millis() - MIN_GAP_MS;
+  sprayReady = true;
+  tft.fillScreen(TFT_BLACK);
+  title("DA THANH TOAN - NHAN XIT", TFT_DARKGREEN);
+  drawBtn(btnXit, 4, true);
+  updateSprayInfo();
+}
+
+void goDone(const char* msg) {
+  state = ST_DONE;
+  stateStart = millis();
+  tft.fillScreen(TFT_BLACK);
+  tft.setTextColor(TFT_WHITE, TFT_BLACK);
+  tft.setTextDatum(MC_DATUM);
+  tft.drawString(msg, 160, 120, 4);
+}
+
+void drawAdminValues() {
+  int b = adminBottle;
+  tft.fillRect(90, 70, 140, 40, TFT_BLACK);
+  tft.fillRect(90, 130, 140, 40, TFT_BLACK);
+  tft.setTextDatum(MC_DATUM);
+  tft.setTextColor(TFT_WHITE, TFT_BLACK);
+  tft.drawString(String(restAngle[b]) + " do", 160, 90, 4);
+  tft.drawString(String(pressAngle[b]) + " do", 160, 150, 4);
+}
+
+void goAdmin() {
+  state = ST_ADMIN;
+  tft.fillScreen(TFT_BLACK);
+  title((String("CAI DAT CO CAU - CHAI ") + (adminBottle + 1)).c_str(), TFT_PURPLE);
+  tft.setTextDatum(MC_DATUM);
+  tft.setTextColor(TFT_LIGHTGREY, TFT_BLACK);
+  tft.drawString("Goc nghi (tay don len)", 160, 60, 2);
+  tft.drawString("Goc xit (ep dau bom)", 160, 120, 2);
+  for (int i = 0; i < 6; i++) drawBtn(adm[i], i < 4 ? 4 : 2);
+  if (NUM_BOTTLES > 1) drawBtn(adm[6], 2);
+  drawAdminValues();
+}
+
+void saveAngles() {
+  for (int i = 0; i < NUM_BOTTLES; i++) {
+    prefs.putInt((String("rest") + i).c_str(), restAngle[i]);
+    prefs.putInt((String("press") + i).c_str(), pressAngle[i]);
+  }
+}
+
+void handleHome() {
+  static uint32_t holdStart = 0;
+  if (touching && tx < 90 && ty < 40) {
+    if (!holdStart) holdStart = millis();
+    if (millis() - holdStart > 2000) { holdStart = 0; goAdmin(); return; }
+  } else {
+    holdStart = 0;
+  }
+  if (!tapEvent) return;
+  for (int i = 0; i < NUM_BOTTLES; i++)
+    if (hit(homeBtn(i), tx, ty)) { selBottle = i; goPackage(); return; }
+}
+
+void handlePackage() {
+  if (!tapEvent) return;
+  for (int i = 0; i < NUM_PACKAGES; i++)
+    if (hit(pkgBtn(i), tx, ty)) { selPackage = i; goQR(); return; }
+  if (hit(btnBack, tx, ty)) goHome();
+}
+
+void handleQR() {
+  uint32_t now = millis();
+  uint32_t elapsed = now - stateStart;
+  uint32_t left = (elapsed >= PAY_TIMEOUT_MS) ? 0 : (PAY_TIMEOUT_MS - elapsed + 999) / 1000;
+  if (now - lastTick >= 1000) { lastTick = now; drawCountdown(left); }
+  if (left == 0) { goHome(); return; }
+  if (tapEvent) {
+    if (hit(btnCancel, tx, ty)) { goHome(); return; }
+#if DEMO_PAYMENT
+    if (hit(btnSim, tx, ty)) { goSpray(); return; }
+#endif
+  }
+#if !DEMO_PAYMENT
+  if (now - lastPoll >= 3000) {
+    lastPoll = now;
+    if (checkPaidSepay(orderCode, PACKAGES[selPackage].price)) { goSpray(); return; }
+  }
+#endif
+}
+
+void handleSpray() {
+  uint32_t now = millis();
+  if (now - stateStart >= SESSION_MS) { goDone("HET THOI GIAN"); return; }
+  bool ready = (now - lastSpray >= MIN_GAP_MS);
+  if (ready != sprayReady) { sprayReady = ready; drawBtn(btnXit, 4, ready); }
+  static uint32_t lastInfo = 0;
+  if (now - lastInfo >= 500) { lastInfo = now; updateSprayInfo(); }
+  if (tapEvent && ready && hit(btnXit, tx, ty)) {
+    drawBtn(btnBusy, 4, true);
+    doSpray(selBottle);
+    spraysLeft--;
+    lastSpray = millis();
+    sprayReady = false;
+    if (spraysLeft <= 0) { goDone("CAM ON QUY KHACH!"); return; }
+    drawBtn(btnXit, 4, false);
+    updateSprayInfo();
+  }
+}
+
+void handleDone() {
+  if (millis() - stateStart > 2500) goHome();
+}
+
+void handleAdmin() {
+  if (!tapEvent) return;
+  int b = adminBottle;
+  if (hit(adm[0], tx, ty)) { restAngle[b] = constrain(restAngle[b] - 1, 0, 180); servos[b].write(restAngle[b]); }
+  else if (hit(adm[1], tx, ty)) { restAngle[b] = constrain(restAngle[b] + 1, 0, 180); servos[b].write(restAngle[b]); }
+  else if (hit(adm[2], tx, ty)) { pressAngle[b] = constrain(pressAngle[b] - 1, 0, 180); }
+  else if (hit(adm[3], tx, ty)) { pressAngle[b] = constrain(pressAngle[b] + 1, 0, 180); }
+  else if (hit(adm[4], tx, ty)) { doSpray(b); }
+  else if (hit(adm[5], tx, ty)) { saveAngles(); goHome(); return; }
+  else if (NUM_BOTTLES > 1 && hit(adm[6], tx, ty)) { adminBottle = (adminBottle + 1) % NUM_BOTTLES; goAdmin(); return; }
+  drawAdminValues();
+}
+
+void touchCalibrate(bool force) {
+  uint16_t cal[5];
+  size_t n = prefs.getBytes("cal", cal, sizeof(cal));
+  if (n == sizeof(cal) && !force) {
+    tft.setTouch(cal);
+    return;
+  }
+  tft.fillScreen(TFT_BLACK);
+  tft.setTextColor(TFT_WHITE, TFT_BLACK);
+  tft.setTextDatum(MC_DATUM);
+  tft.drawString("Cham vao cac goc theo mui ten", 160, 120, 2);
+  tft.calibrateTouch(cal, TFT_MAGENTA, TFT_BLACK, 15);
+  prefs.putBytes("cal", cal, sizeof(cal));
+  tft.setTouch(cal);
+}
+
+void setup() {
+  Serial.begin(115200);
+  randomSeed(esp_random());
+  prefs.begin("xit", false);
+  for (int i = 0; i < 2; i++) {
+    restAngle[i]  = prefs.getInt((String("rest") + i).c_str(), DEF_REST);
+    pressAngle[i] = prefs.getInt((String("press") + i).c_str(), DEF_PRESS);
+  }
+
+  tft.init();
+  tft.setRotation(1);
+  tft.fillScreen(TFT_BLACK);
+
+  ESP32PWM::allocateTimer(0);
+  ESP32PWM::allocateTimer(1);
+  for (int i = 0; i < NUM_BOTTLES; i++) {
+    servos[i].setPeriodHertz(50);
+    servos[i].attach(SERVO_PIN[i], 500, 2400);
+    servos[i].write(restAngle[i]);
+  }
+
+  bool forceCal = tft.getTouchRawZ() > 600;
+  touchCalibrate(forceCal);
+
+  for (int i = 0; i < NUM_PACKAGES; i++)
+    pkgLabel[i] = fmtMoney(PACKAGES[i].price) + " VND - " + String(PACKAGES[i].sprays) + " lan";
+
+  WiFi.mode(WIFI_STA);
+  WiFi.begin(WIFI_SSID, WIFI_PASS);
+#if !DEMO_PAYMENT
+  tft.setTextColor(TFT_WHITE, TFT_BLACK);
+  tft.setTextDatum(MC_DATUM);
+  tft.drawString("Dang ket noi WiFi...", 160, 120, 2);
+  uint32_t t0 = millis();
+  while (WiFi.status() != WL_CONNECTED && millis() - t0 < 10000) delay(200);
+#endif
+  goHome();
+}
+
+void loop() {
+  pollTouch();
+  switch (state) {
+    case ST_HOME:    handleHome();    break;
+    case ST_PACKAGE: handlePackage(); break;
+    case ST_QR:      handleQR();      break;
+    case ST_SPRAY:   handleSpray();   break;
+    case ST_DONE:    handleDone();    break;
+    case ST_ADMIN:   handleAdmin();   break;
+  }
+  static uint32_t lastWifi = 0;
+  if (WiFi.status() != WL_CONNECTED && millis() - lastWifi > 15000) {
+    lastWifi = millis();
+    WiFi.reconnect();
+  }
+  delay(5);
+}
