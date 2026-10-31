@@ -1,0 +1,259 @@
+#include "StateMachine.h"
+
+StateMachine stateMachine;
+
+StateMachine::StateMachine()
+    : _state(STATE_HOME), _payment(nullptr), _selectedBottle(0),
+      _selectedPackage(0), _spraysLeft(0), _stateStartTime(0),
+      _lastSprayTime(0), _sprayWasTriggered(false), _adminBottle(0) {}
+
+void StateMachine::begin(PaymentProvider* provider) {
+    _payment = provider;
+    changeState(STATE_HOME);
+}
+
+void StateMachine::changeState(AppState newState) {
+    _state = newState;
+    _stateStartTime = millis();
+
+    switch (_state) {
+        case STATE_HOME:
+            Serial.println("[State] Chuyen sang STATE_HOME (Cho khach)");
+            _selectedBottle = 0;
+            displayUI.showHomeScreen();
+            break;
+
+        case STATE_PACKAGE:
+            Serial.printf("[State] Chuyen sang STATE_PACKAGE (Chai %d)\n", _selectedBottle + 1);
+            displayUI.showPackageScreen(_selectedBottle);
+            break;
+
+        case STATE_PAYMENT: {
+            Serial.println("[State] Chuyen sang STATE_PAYMENT (Tao don & hien thi VietQR)");
+            uint32_t price = PACKAGES[_selectedPackage].price;
+            _payment->createOrder(_selectedBottle, price, _orderCode, _qrPayload);
+            displayUI.showPaymentScreen(_selectedBottle, price, _orderCode, _qrPayload, PAY_TIMEOUT_MS / 1000);
+            break;
+        }
+
+        case STATE_SPRAYING:
+            Serial.printf("[State] Chuyen sang STATE_SPRAYING (Goi %d lan xit)\n", PACKAGES[_selectedPackage].sprays);
+            _spraysLeft = PACKAGES[_selectedPackage].sprays;
+            _lastSprayTime = millis() - SPRAY_COOLDOWN_MS; // Lan dau tien khong can cho cooldown
+            _sprayWasTriggered = false;
+            displayUI.showSprayScreen(_selectedBottle, _spraysLeft, 0, true);
+            break;
+
+        case STATE_DONE:
+            Serial.println("[State] Chuyen sang STATE_DONE (Hoan tat)");
+            displayUI.showDoneScreen("THANK YOU!");
+            break;
+
+        case STATE_ADMIN:
+            Serial.println("[State] Chuyen sang STATE_ADMIN (Cai dat co cau)");
+            _adminBottle = 0;
+            displayUI.showAdminScreen(_adminBottle, 
+                                      sprayCtrl.getRestAngle(_adminBottle), 
+                                      sprayCtrl.getPressAngle(_adminBottle));
+            break;
+    }
+}
+
+void StateMachine::update() {
+    int tx = 0, ty = 0;
+    displayUI.pollTouch(tx, ty);
+    bool tapped = displayUI.isTapped();
+
+    // Kiểm tra giữ góc màn hình để vào menu Admin (chỉ khi đang ở Home)
+    if (_state == STATE_HOME && displayUI.checkAdminSecretHold()) {
+        changeState(STATE_ADMIN);
+        return;
+    }
+
+    switch (_state) {
+        case STATE_HOME:
+            handleHomeState(tx, ty, tapped);
+            break;
+        case STATE_PACKAGE:
+            handlePackageState(tx, ty, tapped);
+            break;
+        case STATE_PAYMENT:
+            handlePaymentState(tx, ty, tapped);
+            break;
+        case STATE_SPRAYING:
+            handleSprayingState(tx, ty, tapped);
+            break;
+        case STATE_DONE:
+            handleDoneState();
+            break;
+        case STATE_ADMIN:
+            handleAdminState(tx, ty, tapped);
+            break;
+    }
+}
+
+void StateMachine::handleHomeState(int tx, int ty, bool tapped) {
+    // Luôn cập nhật trạng thái hoạt động của nút xịt ngay
+    displayUI.updateQuickSprayStatus(sprayCtrl.isBusy());
+
+    if (!tapped) return;
+
+    // 1. Chạm tay vào nút xịt nhanh -> Kích hoạt chu kỳ 0 -> 180 -> 0 ngay
+    if (displayUI.btnQuickSpray.contains(tx, ty)) {
+        if (!sprayCtrl.isBusy()) {
+            Serial.println("\n[UI] >>> CHAM TAY VAO NUT XIT: CHAY CHU KY 0 -> 180 -> 0 <<<");
+            sprayCtrl.triggerSpray(0);
+        } else {
+            Serial.println("[UI] Servo dang trong chu ky quay, vui long doi...");
+        }
+        return;
+    }
+
+    // 2. Chạm tay vào nút luồng bán hàng -> Chuyển sang chọn gói
+    if (displayUI.btnVendingFlow.contains(tx, ty)) {
+        Serial.println("[UI] Chuyen sang luong ban hang tu dong (Chon goi)...");
+        _selectedBottle = 0;
+        changeState(STATE_PACKAGE);
+        return;
+    }
+}
+
+void StateMachine::handlePackageState(int tx, int ty, bool tapped) {
+    if (!tapped) return;
+
+    if (displayUI.btnBack.contains(tx, ty)) {
+        changeState(STATE_HOME);
+        return;
+    }
+
+    for (int i = 0; i < NUM_PACKAGES; i++) {
+        if (displayUI.btnPackages[i].contains(tx, ty)) {
+            _selectedPackage = i;
+            changeState(STATE_PAYMENT);
+            return;
+        }
+    }
+}
+
+void StateMachine::handlePaymentState(int tx, int ty, bool tapped) {
+    uint32_t now = millis();
+    uint32_t elapsed = now - _stateStartTime;
+
+    // 1. Kiểm tra timeout thanh toán (60s)
+    if (elapsed >= PAY_TIMEOUT_MS) {
+        Serial.println("[State] Het thoi gian cho thanh toan. Tu dong ve Home!");
+        _payment->cancelOrder(_orderCode);
+        changeState(STATE_HOME);
+        return;
+    }
+
+    // Cập nhật số giây đếm ngược còn lại
+    uint32_t remainingSec = (PAY_TIMEOUT_MS - elapsed + 999) / 1000;
+    displayUI.updatePaymentCountdown(remainingSec);
+
+    // 2. Kiểm tra trạng thái thanh toán từ PaymentProvider
+    if (_payment->checkStatus(_orderCode) == PaymentStatus::SUCCESS) {
+        Serial.println("[State] Xac nhan da thanh toan! Chuyen den man hinh xit.");
+        changeState(STATE_SPRAYING);
+        return;
+    }
+
+    // 3. Xử lý chạm nút bấm
+    if (tapped) {
+        if (displayUI.btnCancelPay.contains(tx, ty)) {
+            Serial.println("[State] Khach hang bam HUY thanh toan.");
+            _payment->cancelOrder(_orderCode);
+            changeState(STATE_HOME);
+            return;
+        }
+        if (displayUI.btnSimulatePay.contains(tx, ty)) {
+            Serial.println("[State] Bam nut TEST PAY tren man hinh!");
+            paymentMock.simulatePaymentSuccess(_orderCode);
+            return;
+        }
+    }
+}
+
+void StateMachine::handleSprayingState(int tx, int ty, bool tapped) {
+    uint32_t now = millis();
+    uint32_t timeSinceLastSpray = now - _lastSprayTime;
+    bool inCooldown = (timeSinceLastSpray < SPRAY_COOLDOWN_MS);
+    uint32_t cooldownRemainingSec = inCooldown ? (SPRAY_COOLDOWN_MS - timeSinceLastSpray + 999) / 1000 : 0;
+    bool isSpraying = sprayCtrl.isBusy();
+    bool canSpray = (!inCooldown && !isSpraying && _spraysLeft > 0);
+
+    // Cập nhật giao diện đếm ngược & nút bấm
+    displayUI.updateSprayStatus(_spraysLeft, cooldownRemainingSec, canSpray, isSpraying);
+
+    // Kiểm tra hoàn tất đơn hàng: đã xịt hết số lần và servo đã quay về vị trí nghỉ
+    if (_sprayWasTriggered && _spraysLeft <= 0 && !isSpraying) {
+        changeState(STATE_DONE);
+        return;
+    }
+
+    // Xử lý bấm nút xịt (Chạy trọn chu kỳ 0 -> 180 -> 0)
+    if (tapped && canSpray) {
+        if (displayUI.btnSpray.contains(tx, ty)) {
+            Serial.printf("[State] Khach bam nut XIT! Con lai %d lan.\n", _spraysLeft - 1);
+            sprayCtrl.triggerSpray(_selectedBottle);
+            _lastSprayTime = millis();
+            _spraysLeft--;
+            _sprayWasTriggered = true;
+        }
+    }
+}
+
+void StateMachine::handleDoneState() {
+    if (millis() - _stateStartTime >= DONE_TIMEOUT_MS) {
+        changeState(STATE_HOME);
+    }
+}
+
+void StateMachine::handleAdminState(int tx, int ty, bool tapped) {
+    if (!tapped) return;
+
+    int b = _adminBottle;
+    int currentRest = sprayCtrl.getRestAngle(b);
+    int currentPress = sprayCtrl.getPressAngle(b);
+
+    if (displayUI.btnAdminRestMinus.contains(tx, ty)) {
+        sprayCtrl.setRestAngle(b, currentRest - 1);
+        displayUI.updateAdminAngles(sprayCtrl.getRestAngle(b), currentPress);
+    } 
+    else if (displayUI.btnAdminRestPlus.contains(tx, ty)) {
+        sprayCtrl.setRestAngle(b, currentRest + 1);
+        displayUI.updateAdminAngles(sprayCtrl.getRestAngle(b), currentPress);
+    } 
+    else if (displayUI.btnAdminPressMinus.contains(tx, ty)) {
+        sprayCtrl.setPressAngle(b, currentPress - 1);
+        displayUI.updateAdminAngles(currentRest, sprayCtrl.getPressAngle(b));
+    } 
+    else if (displayUI.btnAdminPressPlus.contains(tx, ty)) {
+        sprayCtrl.setPressAngle(b, currentPress + 1);
+        displayUI.updateAdminAngles(currentRest, sprayCtrl.getPressAngle(b));
+    } 
+    else if (displayUI.btnAdminTest.contains(tx, ty)) {
+        Serial.println("[Admin] Test xit thu 0 -> 180 -> 0 do...");
+        sprayCtrl.triggerSpray(b);
+    } 
+    else if (displayUI.btnAdminCalibTouch.contains(tx, ty)) {
+        displayUI.calibrateTouch(true);
+        displayUI.showAdminScreen(b, sprayCtrl.getRestAngle(b), sprayCtrl.getPressAngle(b));
+    } 
+    else if (NUM_SERVOS > 1 && displayUI.btnAdminSwitchBottle.contains(tx, ty)) {
+        _adminBottle = (_adminBottle + 1) % NUM_SERVOS;
+        displayUI.showAdminScreen(_adminBottle, 
+                                  sprayCtrl.getRestAngle(_adminBottle), 
+                                  sprayCtrl.getPressAngle(_adminBottle));
+    } 
+    else if (displayUI.btnAdminSave.contains(tx, ty)) {
+        sprayCtrl.saveAnglesToNVS();
+        changeState(STATE_HOME);
+    }
+}
+
+void StateMachine::debugTriggerSpray() {
+    if (_state == STATE_SPRAYING) {
+        sprayCtrl.triggerSpray(_selectedBottle);
+    }
+}

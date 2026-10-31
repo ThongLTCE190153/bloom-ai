@@ -1,0 +1,105 @@
+#include "PaymentProvider.h"
+
+MockPaymentProvider paymentMock;
+
+MockPaymentProvider::MockPaymentProvider() : _isPaid(false) {}
+
+void MockPaymentProvider::begin() {
+    randomSeed(esp_random());
+    _isPaid = false;
+    _currentOrderCode = "";
+}
+
+String MockPaymentProvider::tlv(const char* tag, const String& val) {
+    char lenBuf[4];
+    snprintf(lenBuf, sizeof(lenBuf), "%02d", (int)val.length());
+    return String(tag) + lenBuf + val;
+}
+
+uint16_t MockPaymentProvider::crc16(const String& data) {
+    uint16_t crc = 0xFFFF;
+    for (size_t i = 0; i < data.length(); i++) {
+        crc ^= (uint16_t)((uint8_t)data[i]) << 8;
+        for (int b = 0; b < 8; b++) {
+            crc = (crc & 0x8000) ? (uint16_t)((crc << 1) ^ 0x1021) : (uint16_t)(crc << 1);
+        }
+    }
+    return crc;
+}
+
+String MockPaymentProvider::buildVietQR(uint32_t amount, const String& memo) {
+    // 1. Thông tin tài khoản thụ hưởng
+    String acctInfo = tlv("00", BANK_BIN) + tlv("01", ACCOUNT_NO);
+    String merchantInfo = tlv("00", "A000000727") + tlv("01", acctInfo) + tlv("02", "QRIBFTTA");
+
+    // 2. Ghép chuỗi payload VietQR theo chuẩn EMVCo
+    String payload = tlv("00", "01") + 
+                     tlv("01", "12") + 
+                     tlv("38", merchantInfo) + 
+                     tlv("53", "704") + 
+                     tlv("54", String(amount)) + 
+                     tlv("58", "VN") + 
+                     tlv("62", tlv("08", memo));
+
+    payload += "6304"; // Tag 63 (CRC), độ dài 04
+
+    // 3. Tính mã kiểm tra CRC-CCITT 16
+    char crcStr[5];
+    snprintf(crcStr, sizeof(crcStr), "%04X", crc16(payload));
+    payload += crcStr;
+
+    return payload;
+}
+
+bool MockPaymentProvider::createOrder(int bottleId, uint32_t amount, String& outOrderCode, String& outQrPayload) {
+    (void)bottleId;
+    _isPaid = false;
+    _currentOrderCode = "XIT" + String(random(100000, 999999));
+    outOrderCode = _currentOrderCode;
+    outQrPayload = buildVietQR(amount, _currentOrderCode);
+
+    Serial.println("\n----------------------------------------------");
+    Serial.printf("[PaymentProvider] Tao don hang moi: %s\n", _currentOrderCode.c_str());
+    Serial.printf("- So tien: %lu VND\n", (unsigned long)amount);
+    Serial.printf("- VietQR Payload: %s\n", outQrPayload.c_str());
+    Serial.println("- Ghi chu test: Nhap 'pay' tren Serial hoac bam 'TEST PAY' tren man hinh!");
+    Serial.println("----------------------------------------------\n");
+
+    return true;
+}
+
+PaymentStatus MockPaymentProvider::checkStatus(const String& orderCode) {
+    if (orderCode == _currentOrderCode && _isPaid) {
+        return PaymentStatus::SUCCESS;
+    }
+    return PaymentStatus::PENDING;
+}
+
+void MockPaymentProvider::cancelOrder(const String& orderCode) {
+    if (orderCode == _currentOrderCode) {
+        Serial.printf("[PaymentProvider] Huy don hang: %s\n", orderCode.c_str());
+        _isPaid = false;
+        _currentOrderCode = "";
+    }
+}
+
+void MockPaymentProvider::simulatePaymentSuccess(const String& orderCode) {
+    if (orderCode == _currentOrderCode) {
+        _isPaid = true;
+        Serial.printf("[PaymentProvider] [MOCK] Da xac nhan thanh toan thanh cong cho: %s!\n", orderCode.c_str());
+    }
+}
+
+bool MockPaymentProvider::handleSerialInput(const String& cmd) {
+    String s = cmd;
+    s.trim();
+    if (s.equalsIgnoreCase("pay") || s.equalsIgnoreCase("paid") || s.equalsIgnoreCase("ok")) {
+        if (_currentOrderCode.length() > 0) {
+            simulatePaymentSuccess(_currentOrderCode);
+            return true;
+        } else {
+            Serial.println("[PaymentProvider] Hien khong co don hang nao dang cho!");
+        }
+    }
+    return false;
+}
